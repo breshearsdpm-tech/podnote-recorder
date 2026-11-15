@@ -70,5 +70,12 @@ button:disabled { opacity: .4; cursor: default; }
 .status.pending { color: var(--warn); }
 .status.uploaded { color: var(--ok); }
 .status.error { color: var(--rec); }
+.chips { display: flex; flex-wrap: wrap; gap: 10px; }
+.chip { padding: 12px 16px; font-size: 17px; font-weight: 600; text-align: left; min-width: 180px; }
+.chip small { display: block; font-weight: 400; font-size: 13px; color: var(--muted); }
+.chip.selected { border: 2px solid var(--brand); }
+.chip.done { opacity: .5; }
+.badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 6px;
+  background: var(--warn); color: #fff; margin-left: 6px; vertical-align: middle; }
 .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 20px); transform: translateX(-50%);
   background: var(--text); color: var(--bg); padding: 12px 18px; border-radius: 12px; max-width: 90vw; z-index: 5; }

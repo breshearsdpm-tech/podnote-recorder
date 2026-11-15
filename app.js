@@ -195,6 +195,7 @@
     $("quickNotes").value = "";
     $("consent").checked = true; // you only open PodNote for patients who signed the AI waiver
     await renderQueue();
+    renderSchedule();
     // Google sign-in and the Share sheet both need a tap, so only auto-upload when
     // we already hold a valid Drive token.
     if (useDirect() && token && Date.now() < tokenExpires - 60000) {
@@ -237,7 +238,9 @@
     return new Promise((resolve, reject) => {
       tokenClient = google.accounts.oauth2.initTokenClient({
         client_id: CFG.googleClientId,
-        scope: "https://www.googleapis.com/auth/drive.file",
+        // drive.file: upload recordings. drive.readonly: read the checked-in list
+        // that Chart Prep writes to My Drive/PodNote/Schedule on the office PC.
+        scope: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly",
         callback: (resp) => {
           if (resp.error) return reject(new Error(resp.error));
           token = resp.access_token;
@@ -245,6 +248,7 @@
           $("driveStatus").textContent = "Drive: connected";
           $("driveStatus").classList.add("on");
           resolve(token);
+          setTimeout(loadSchedule, 0);
         },
         error_callback: (err) => reject(new Error(err.message || err.type || "Sign-in cancelled"))
       });
@@ -286,6 +290,69 @@
     if (!put.ok) throw new Error(`Upload failed ${put.status}`);
     return put.json();
   }
+
+  // ---------- checked-in patients (from Chart Prep via Drive) ----------
+  let schedule = [], schedTimer = null;
+  const tokenValid = () => token && Date.now() < tokenExpires - 60000;
+
+  async function loadSchedule() {
+    if (!useDirect()) {
+      $("schedNote").textContent = "Add the Google sign-in Client ID in config.js to see checked-in patients here.";
+      return;
+    }
+    if (!tokenValid()) {
+      $("schedNote").textContent = "Tap Refresh to connect Google Drive and load today's checked-in patients.";
+      return;
+    }
+    try {
+      const q = encodeURIComponent("name='checked_in.json' and trashed=false");
+      const list = await (await gfetch(
+        `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime desc&pageSize=1&fields=files(id,modifiedTime)`
+      )).json();
+      if (!list.files || !list.files.length) {
+        schedule = [];
+        $("schedNote").textContent = "No check-ins yet today. Chart Prep adds patients as they're roomed.";
+      } else {
+        const data = await (await gfetch(`https://www.googleapis.com/drive/v3/files/${list.files[0].id}?alt=media`)).json();
+        schedule = data.date === todayISO() ? data.patients || [] : [];
+        const t = new Date(data.updated || list.files[0].modifiedTime);
+        $("schedNote").textContent = schedule.length
+          ? `Updated ${t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Tap a patient, then Record.`
+          : "No check-ins yet today.";
+      }
+    } catch (e) {
+      $("schedNote").textContent = "Couldn't load the checked-in list: " + e.message;
+    }
+    renderSchedule();
+  }
+
+  async function renderSchedule() {
+    const done = new Set((await allRecs()).filter((r) => r.meta.date_of_service === todayISO()).map((r) => r.meta.patient));
+    const box = $("schedList");
+    box.innerHTML = "";
+    for (const p of schedule) {
+      const b = document.createElement("button");
+      b.className = "chip" + (done.has(p.name) ? " done" : "") + ($("patient").value === p.name ? " selected" : "");
+      b.innerHTML = `<span></span>${p.new_patient ? '<span class="badge">NEW</span>' : ""}<small></small>`;
+      b.querySelector("span").textContent = p.name;
+      b.querySelector("small").textContent = [p.room, done.has(p.name) ? "recorded" : ""].filter(Boolean).join(" · ");
+      b.onclick = () => {
+        if (mediaRecorder) return;
+        $("patient").value = p.name;
+        $("visitType").value = p.new_patient ? "New patient" : "Follow-up";
+        $("consent").checked = true;
+        renderSchedule();
+        $("btnRecord").scrollIntoView({ behavior: "smooth", block: "center" });
+      };
+      box.appendChild(b);
+    }
+  }
+
+  $("btnSched").onclick = () => {
+    if (useDirect() && !tokenValid()) getToken().catch((e) => toast(e.message, 6000));
+    else loadSchedule();
+  };
+  schedTimer = setInterval(() => { if (!mediaRecorder && tokenValid()) loadSchedule(); }, 60000);
 
   // ---------- Share sheet fallback ----------
   async function shareUpload(rec) {
@@ -406,6 +473,7 @@
   allRecs().then(async (recs) => {
     for (const r of recs) if (r.status === "uploading") { r.status = "pending"; await putRec(r); }
     renderQueue();
+    loadSchedule();
   });
 
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
