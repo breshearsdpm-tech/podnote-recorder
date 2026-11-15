@@ -193,7 +193,7 @@
     // reset per-visit fields, keep date & visit type
     $("patient").value = "";
     $("quickNotes").value = "";
-    $("consent").checked = false;
+    $("consent").checked = true; // you only open PodNote for patients who signed the AI waiver
     await renderQueue();
     // Google sign-in and the Share sheet both need a tap, so only auto-upload when
     // we already hold a valid Drive token.
