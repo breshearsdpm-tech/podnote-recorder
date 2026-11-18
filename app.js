@@ -232,26 +232,50 @@
     });
   }
 
-  async function getToken() {
-    if (token && Date.now() < tokenExpires - 60000) return token;
-    await loadGIS();
-    return new Promise((resolve, reject) => {
+  // Safari blocks the Google sign-in popup unless it opens synchronously inside the tap.
+  // So the sign-in library and token client are prepared at page load, and getToken()
+  // calls requestAccessToken() without any await in between.
+  let pendingToken = null;
+  function prepareTokenClient() {
+    if (!useDirect()) return Promise.resolve();
+    return loadGIS().then(() => {
       tokenClient = google.accounts.oauth2.initTokenClient({
         client_id: CFG.googleClientId,
         // drive.file: upload recordings. drive.readonly: read the checked-in list
         // that Chart Prep writes to My Drive/PodNote/Schedule on the office PC.
         scope: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly",
         callback: (resp) => {
-          if (resp.error) return reject(new Error(resp.error));
+          const p = pendingToken; pendingToken = null;
+          if (resp.error) return p && p.reject(new Error(resp.error_description || resp.error));
           token = resp.access_token;
           tokenExpires = Date.now() + (resp.expires_in || 3600) * 1000;
           $("driveStatus").textContent = "Drive: connected";
           $("driveStatus").classList.add("on");
-          resolve(token);
+          $("btnSched").textContent = "Refresh";
+          if (p) p.resolve(token);
           setTimeout(loadSchedule, 0);
+          setTimeout(uploadPending, 0);
         },
-        error_callback: (err) => reject(new Error(err.message || err.type || "Sign-in cancelled"))
+        error_callback: (err) => {
+          const p = pendingToken; pendingToken = null;
+          if (p) p.reject(new Error(err.type === "popup_failed_to_open"
+            ? "Safari blocked the Google sign-in window. Allow pop-ups for this site, then tap Connect again."
+            : (err.message || err.type || "Sign-in cancelled")));
+        }
       });
+    });
+  }
+  const tokenClientReady = prepareTokenClient().catch(() => {});
+
+  function getToken() {
+    if (token && Date.now() < tokenExpires - 60000) return Promise.resolve(token);
+    if (!tokenClient) {
+      return tokenClientReady.then(() => {
+        throw new Error(tokenClient ? "Google sign-in is ready. Tap Connect again." : "Could not load Google sign-in (offline?)");
+      });
+    }
+    return new Promise((resolve, reject) => {
+      pendingToken = { resolve, reject };
       tokenClient.requestAccessToken({ prompt: "" });
     });
   }
@@ -301,7 +325,8 @@
       return;
     }
     if (!tokenValid()) {
-      $("schedNote").textContent = "Tap Refresh to connect Google Drive and load today's checked-in patients.";
+      $("btnSched").textContent = "Connect Google";
+      $("schedNote").textContent = "Tap Connect Google (once each time you open PodNote) to load today's checked-in patients.";
       return;
     }
     try {
@@ -372,8 +397,16 @@
 
   // ---------- upload orchestration ----------
   const busy = new Set();
+  async function uploadPending() {
+    if (!tokenValid()) return;
+    for (const r of await allRecs()) if (r.status === "pending" || r.status === "error") await uploadOne(r.id);
+  }
+
   async function uploadOne(id) {
     if (busy.has(id)) return;
+    // Start Google sign-in before any await so Safari treats the popup as part of the tap.
+    const signIn = useDirect() && !tokenValid() ? getToken() : null;
+    if (signIn) signIn.catch(() => {});
     const rec = (await allRecs()).find((r) => r.id === id);
     if (!rec || rec.status === "uploaded") return;
     busy.add(id);
@@ -381,6 +414,7 @@
     await putRec(rec); renderQueue();
     try {
       if (useDirect()) {
+        if (signIn) await signIn;
         const parent = await ensureFolder();
         // sidecar first so the PC always finds it when the audio arrives
         await driveUpload(rec.id + ".json", "application/json", JSON.stringify(rec.meta, null, 2), parent);
