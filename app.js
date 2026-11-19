@@ -48,6 +48,26 @@
   const delRec = (id) => tx("readwrite", (s) => s.delete(id));
   const allRecs = () => tx("readonly", (s) => s.getAll());
 
+  // Safari can lose access to a Blob saved in IndexedDB (after the app is reloaded or
+  // sits in the background), so the audio is saved as plain bytes (ArrayBuffer) instead.
+  // Older recordings still hold a Blob; audioBlob() reads it and keeps the bytes.
+  const audioSize = (r) => (r.audio ? r.audio.byteLength : r.blob ? r.blob.size : 0);
+  async function audioBlob(rec) {
+    if (rec.audio) return new Blob([rec.audio], { type: rec.mime });
+    if (!rec.blob) throw new Error("This recording has no audio saved");
+    let buf;
+    try {
+      buf = await rec.blob.arrayBuffer();
+    } catch (e) {
+      throw new Error("Safari can't read this recording's audio any more (" + (e.message || e.name) + ")");
+    }
+    if (!buf.byteLength) throw new Error("This recording's audio is empty");
+    rec.audio = buf;
+    delete rec.blob;
+    await putRec(rec);
+    return new Blob([buf], { type: rec.mime });
+  }
+
   // ---------- form setup ----------
   (CFG.visitTypes || ["Follow-up"]).forEach((v) => {
     const o = document.createElement("option");
@@ -168,6 +188,8 @@
 
     const mime = mediaRecorder.mimeType || (chunks[0] && chunks[0].type) || "audio/mp4";
     const blob = new Blob(chunks, { type: mime });
+    let audio = null;
+    try { audio = await blob.arrayBuffer(); } catch (_) {}
     const now = new Date();
     const stamp = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
     const dos = $("dos").value || todayISO();
@@ -190,7 +212,7 @@
         duration_seconds: Math.round(elapsedBefore),
         app: "PodNote iPad 1.0"
       },
-      blob
+      ...(audio ? { audio } : { blob })
     };
     try {
       await putRec(rec);
@@ -426,7 +448,7 @@
 
   // ---------- Share sheet fallback ----------
   async function shareUpload(rec) {
-    const file = new File([rec.blob], rec.fileName, { type: rec.mime });
+    const file = new File([await audioBlob(rec)], rec.fileName, { type: rec.mime });
     const meta = new File([JSON.stringify(rec.meta, null, 2)], rec.id + ".json", { type: "application/json" });
     const files = [meta, file];
     if (navigator.canShare && navigator.canShare({ files })) {
@@ -459,11 +481,13 @@
     await putRec(rec); renderQueue();
     try {
       if (useDirect()) {
+        // Read the audio first: if Safari can't read it, send nothing (no lone info file).
+        const body = await audioBlob(rec);
         if (signIn) await signIn;
         const parent = await ensureFolder();
         // sidecar first so the PC always finds it when the audio arrives
         await driveUpload(rec.id + ".json", "application/json", JSON.stringify(rec.meta, null, 2), parent);
-        await driveUpload(rec.fileName, rec.mime, rec.blob, parent);
+        await driveUpload(rec.fileName, rec.mime, body, parent);
       } else {
         await shareUpload(rec);
       }
@@ -499,7 +523,7 @@
         <div class="actions"></div>`;
       li.querySelector(".who").textContent = r.meta.patient;
       li.querySelector(".meta").textContent =
-        `${r.meta.visit_type} · ${r.meta.date_of_service} · ${fmtTime(r.seconds)} · ${(r.blob.size / 1048576).toFixed(1)} MB`;
+        `${r.meta.visit_type} · ${r.meta.date_of_service} · ${fmtTime(r.seconds)} · ${(audioSize(r) / 1048576).toFixed(1)} MB`;
       li.querySelector(".status").textContent = label + (r.error ? ` – ${r.error}` : "");
       const actions = li.querySelector(".actions");
       if (r.status !== "uploaded") {
@@ -513,7 +537,10 @@
       const play = document.createElement("button");
       play.className = "small-btn";
       play.textContent = "Play";
-      play.onclick = () => { const a = new Audio(URL.createObjectURL(r.blob)); a.play(); };
+      play.onclick = async () => {
+        try { new Audio(URL.createObjectURL(await audioBlob(r))).play(); }
+        catch (e) { toast(e.message, 8000); }
+      };
       actions.appendChild(play);
       const del = document.createElement("button");
       del.className = "small-btn";
@@ -553,6 +580,13 @@
   // anything left "uploading" from a closed session goes back to pending
   allRecs().then(async (recs) => {
     for (const r of recs) if (r.status === "uploading") { r.status = "pending"; await putRec(r); }
+    // Convert older recordings to plain bytes right away, while Safari can still read them.
+    for (const r of recs) {
+      if (r.status !== "uploaded" && r.blob && !r.audio) {
+        try { await audioBlob(r); }
+        catch (e) { r.status = "error"; r.error = e.message; await putRec(r); }
+      }
+    }
     renderQueue();
     loadSchedule();
   });

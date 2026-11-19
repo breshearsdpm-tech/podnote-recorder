@@ -1,6 +1,6 @@
 // Caches the app shell so PodNote opens (and records) even with poor clinic Wi-Fi.
 // Bump VERSION whenever you change any app file.
-const VERSION = "podnote-v7";
+const VERSION = "podnote-v8";
 const SHELL = ["./", "index.html", "styles.css", "app.js", "config.js", "manifest.webmanifest", "icon.svg", "icon-180.png"];
 
 self.addEventListener("install", (e) => {
