@@ -55,6 +55,7 @@ button:disabled { opacity: .4; cursor: default; }
 .rec { background: var(--rec); color: #fff; border-color: var(--rec); }
 .rec.recording { animation: pulse 1.4s infinite; }
 .stop { background: var(--brand); color: #fff; border-color: var(--brand); }
+.hold { border: 2px solid var(--warn); color: var(--warn); background: var(--card); }
 @keyframes pulse { 50% { opacity: .65; } }
 .small-btn { padding: 8px 14px; font-size: 15px; }
 .primary { background: var(--brand); color: #fff; border-color: var(--brand); }

@@ -79,6 +79,9 @@
   // ---------- recording ----------
   let mediaRecorder = null, stream = null, chunks = [], startedAt = 0, elapsedBefore = 0;
   let tickTimer = null, audioCtx = null, analyser = null, rafId = null, wakeLock = null;
+  // "Hold": stop for now, see another patient, then continue the same visit later.
+  // resumeRec = the held visit being continued; saveMode = "hold" when Hold was tapped.
+  let resumeRec = null, saveMode = "save", heldRecs = [];
 
   function pickMime() {
     const options = ["audio/mp4", "audio/mp4;codecs=mp4a.40.2", "audio/webm;codecs=opus", "audio/webm"];
@@ -119,7 +122,19 @@
     if (document.visibilityState === "visible" && mediaRecorder && mediaRecorder.state !== "inactive") requestWakeLock();
   });
 
-  async function startRecording() {
+  const heldFor = (name) => heldRecs.find((r) => r.meta.patient.trim().toLowerCase() === name.trim().toLowerCase());
+
+  async function startRecording(arg) {
+    if (mediaRecorder) return;
+    let held = arg && arg.parts ? arg : null;
+    if (!held) held = heldFor($("patient").value) || null;   // Record on a held patient = continue it
+    if (held) {
+      $("patient").value = held.meta.patient;
+      $("visitType").value = held.meta.visit_type;
+      $("dos").value = held.meta.date_of_service;
+      if (!$("quickNotes").value.trim()) $("quickNotes").value = held.meta.quick_notes || "";
+      $("consent").checked = true;
+    }
     if (!$("patient").value.trim()) { toast("Enter the patient name or MRN first."); $("patient").focus(); return; }
     if (!$("consent").checked) { toast("Confirm the patient consented to recording."); return; }
     try {
@@ -137,7 +152,10 @@
     mediaRecorder.onstop = saveRecording;
     mediaRecorder.start(5000); // flush a chunk every 5s so little is lost if something goes wrong
     startedAt = Date.now();
-    elapsedBefore = 0;
+    resumeRec = held;
+    saveMode = "save";
+    elapsedBefore = held ? held.seconds : 0;
+    if (held) toast(`Continuing ${held.meta.patient}'s recording.`);
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioCtx.createAnalyser();
@@ -175,8 +193,91 @@
   function stopRecording() {
     if (!mediaRecorder || mediaRecorder.state === "inactive") return;
     renewSignInDuringTap();
+    saveMode = "save";
     elapsedBefore = elapsed();
     mediaRecorder.stop();
+  }
+
+  // Hold: keep what was recorded on the iPad (not uploaded) and free the recorder for
+  // the next patient. Tapping Resume (or the patient again, then Record) continues it.
+  function holdRecording() {
+    if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+    saveMode = "hold";
+    elapsedBefore = elapsed();
+    mediaRecorder.stop();
+  }
+
+  // Join the parts of a held visit into one WAV file (16 kHz mono, plenty for speech).
+  async function mergeToWav(parts) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const OCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const ctx = new Ctx();
+    let rate = 16000;
+    const pcm = [];
+    try {
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        const bytes = p.audio ? p.audio.slice(0) : await p.blob.arrayBuffer();
+        const buf = await new Promise((res, rej) => {
+          const r = ctx.decodeAudioData(bytes, res, rej);
+          if (r && r.then) r.then(res, rej);
+        });
+        let off;
+        try { off = new OCtx(1, Math.max(1, Math.ceil(buf.duration * rate)), rate); }
+        catch (_) { rate = 22050; off = new OCtx(1, Math.max(1, Math.ceil(buf.duration * rate)), rate); }
+        const src = off.createBufferSource();
+        src.buffer = buf;
+        src.connect(off.destination);
+        src.start(0);
+        const out = await new Promise((res, rej) => {
+          off.oncomplete = (e) => res(e.renderedBuffer);
+          const r = off.startRendering();
+          if (r && r.then) r.then(res, rej);
+        });
+        if (i) pcm.push(new Float32Array(Math.round(rate * 0.7)));  // short gap between parts
+        pcm.push(out.getChannelData(0).slice());
+      }
+    } finally {
+      try { ctx.close(); } catch (_) {}
+    }
+    const n = pcm.reduce((s, a) => s + a.length, 0);
+    const wav = new ArrayBuffer(44 + n * 2), v = new DataView(wav);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, n * 2, true);
+    let o = 44;
+    for (const a of pcm) for (let i = 0; i < a.length; i++, o += 2) {
+      const s = Math.max(-1, Math.min(1, a[i]));
+      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return wav;
+  }
+
+  // Turn a visit's parts into the recording that gets uploaded (one part: as recorded;
+  // several: joined into one WAV). Returns the saved recording.
+  async function finishVisit(id, parts, meta, seconds, createdAt) {
+    let rec;
+    if (parts.length === 1) {
+      const p = parts[0];
+      rec = { mime: p.mime, fileName: `${id}.${extFor(p.mime)}`, ...(p.audio ? { audio: p.audio } : { blob: p.blob }) };
+    } else {
+      try {
+        rec = { mime: "audio/wav", fileName: `${id}.wav`, audio: await mergeToWav(parts) };
+      } catch (e) {
+        // Couldn't join: keep it on hold so nothing is lost, and say why.
+        const held = { id, createdAt, fileName: "", mime: parts[0].mime, seconds, status: "held",
+          error: "Couldn't join the parts (" + (e.message || e.name) + ")", meta, parts };
+        await putRec(held);
+        toast(held.error, 8000);
+        return held;
+      }
+    }
+    Object.assign(rec, { id, createdAt, seconds, status: "pending", error: "",
+      meta: { ...meta, duration_seconds: seconds, parts: parts.length } });
+    await putRec(rec);
+    return rec;
   }
 
   async function saveRecording() {
@@ -193,33 +294,36 @@
     const now = new Date();
     const stamp = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
     const dos = $("dos").value || todayISO();
-    const base = `${dos}_${stamp}__${slug($("patient").value)}__${slug($("visitType").value)}`;
-    const rec = {
-      id: base,
-      createdAt: now.toISOString(),
-      fileName: `${base}.${extFor(mime)}`,
-      mime,
-      seconds: Math.round(elapsedBefore),
-      status: "pending",
-      error: "",
-      meta: {
-        patient: $("patient").value.trim(),
-        visit_type: $("visitType").value,
-        date_of_service: dos,
-        quick_notes: $("quickNotes").value.trim(),
-        consent: $("consent").checked,
-        recorded_at: now.toISOString(),
-        duration_seconds: Math.round(elapsedBefore),
-        app: "PodNote iPad 1.0"
-      },
-      ...(audio ? { audio } : { blob })
+    const prev = resumeRec;
+    const base = prev ? prev.id : `${dos}_${stamp}__${slug($("patient").value)}__${slug($("visitType").value)}`;
+    const createdAt = prev ? prev.createdAt : now.toISOString();
+    const seconds = Math.round(elapsedBefore);
+    const parts = [...(prev ? prev.parts : []), audio ? { audio, mime } : { blob, mime }];
+    const meta = {
+      patient: $("patient").value.trim(),
+      visit_type: $("visitType").value,
+      date_of_service: dos,
+      quick_notes: $("quickNotes").value.trim(),
+      consent: $("consent").checked,
+      recorded_at: createdAt,
+      duration_seconds: seconds,
+      app: "PodNote iPad 1.1"
     };
+    const hold = saveMode === "hold";
+    let rec;
     try {
-      await putRec(rec);
+      if (hold) {
+        rec = { id: base, createdAt, fileName: "", mime, seconds, status: "held", error: "", meta, parts };
+        await putRec(rec);
+      } else {
+        rec = await finishVisit(base, parts, meta, seconds, createdAt);
+      }
     } catch (e) {
       toast("Could not save on iPad: " + e.message, 8000);
     }
     mediaRecorder = null;
+    resumeRec = null;
+    saveMode = "save";
     setUI("idle");
     $("timer").textContent = "00:00";
     // reset per-visit fields, keep date & visit type
@@ -228,6 +332,11 @@
     $("consent").checked = true; // you only open PodNote for patients who signed the AI waiver
     await renderQueue();
     renderSchedule();
+    if (!rec) return;
+    if (rec.status === "held") {
+      if (hold) toast(`${meta.patient} is on hold (${fmtTime(seconds)}). Tap Resume on it when you go back.`, 6000);
+      return;
+    }
     // Google sign-in and the Share sheet both need a tap, so only auto-upload when
     // we already hold a valid Drive token.
     if (useDirect() && token && Date.now() < tokenExpires - 60000) {
@@ -244,6 +353,7 @@
     rec.classList.toggle("recording", state === "recording");
     pause.disabled = state === "idle";
     stop.disabled = state === "idle";
+    $("btnHold").disabled = state === "idle";
     pause.textContent = state === "paused" ? "Resume" : "Pause";
     $("recState").textContent = { idle: "Ready", recording: "Recording…", paused: "Paused" }[state];
     ["patient", "visitType", "dos", "consent"].forEach((id) => ($(id).disabled = state !== "idle"));
@@ -410,7 +520,9 @@
   }
 
   async function renderSchedule() {
-    const done = new Set((await allRecs()).filter((r) => r.meta.date_of_service === todayISO()).map((r) => r.meta.patient));
+    const todays = (await allRecs()).filter((r) => r.meta.date_of_service === todayISO());
+    const done = new Set(todays.filter((r) => r.status !== "held").map((r) => r.meta.patient));
+    const onHold = new Set(todays.filter((r) => r.status === "held").map((r) => r.meta.patient));
     const box = $("schedList");
     box.innerHTML = "";
     for (const p of schedule) {
@@ -418,7 +530,8 @@
       b.className = "chip" + (done.has(p.name) ? " done" : "") + ($("patient").value === p.name ? " selected" : "");
       b.innerHTML = `<span></span>${p.new_patient ? '<span class="badge">NEW</span>' : ""}<small></small>`;
       b.querySelector("span").textContent = p.name;
-      b.querySelector("small").textContent = [p.room, done.has(p.name) ? "recorded" : ""].filter(Boolean).join(" · ");
+      b.querySelector("small").textContent =
+        [p.room, onHold.has(p.name) ? "on hold" : done.has(p.name) ? "recorded" : ""].filter(Boolean).join(" · ");
       b.onclick = () => {
         if (mediaRecorder) return;
         renewSignInDuringTap();
@@ -466,7 +579,7 @@
   const busy = new Set();
   async function uploadPending() {
     if (!tokenValid()) return;
-    for (const r of await allRecs()) if (r.status === "pending" || r.status === "error") await uploadOne(r.id);
+    for (const r of await allRecs()) if ((r.status === "pending" || r.status === "error") && !r.parts) await uploadOne(r.id);
   }
 
   async function uploadOne(id) {
@@ -476,7 +589,7 @@
     const signIn = useDirect() && !tokenValid() ? getToken() : null;
     if (signIn) signIn.catch(() => {});
     const rec = (await allRecs()).find((r) => r.id === id);
-    if (!rec || rec.status === "uploaded") { busy.delete(id); return; }
+    if (!rec || rec.status === "uploaded" || rec.status === "held") { busy.delete(id); return; }
     rec.status = "uploading"; rec.error = "";
     await putRec(rec); renderQueue();
     try {
@@ -508,12 +621,53 @@
     const recs = (await allRecs()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const ul = $("queue");
     ul.innerHTML = "";
+    heldRecs = recs.filter((r) => r.status === "held");
     $("emptyQueue").hidden = recs.length > 0;
-    const waiting = recs.filter((r) => r.status !== "uploaded").length;
+    const waiting = recs.filter((r) => r.status !== "uploaded" && r.status !== "held").length;
     $("btnUploadAll").textContent = waiting ? `Upload all (${waiting})` : "Upload all";
+    // On-hold visits first, so they're easy to find when you go back to the patient.
+    recs.sort((a, b) => (b.status === "held") - (a.status === "held"));
     for (const r of recs) {
       const li = document.createElement("li");
-      const label = { pending: "Not uploaded", uploading: "Uploading…", uploaded: "Uploaded", error: "Failed" }[r.status] || r.status;
+      const label = { pending: "Not uploaded", uploading: "Uploading…", uploaded: "Uploaded", error: "Failed",
+        held: "On hold – tap Resume to continue" }[r.status] || r.status;
+      if (r.status === "held") {
+        li.innerHTML = `<div><div class="who"></div><div class="meta"></div><div class="status pending"></div></div>
+          <div class="actions"></div>`;
+        li.querySelector(".who").textContent = r.meta.patient;
+        li.querySelector(".meta").textContent =
+          `${r.meta.visit_type} · ${r.meta.date_of_service} · ${fmtTime(r.seconds)} so far · ${r.parts.length} part${r.parts.length > 1 ? "s" : ""}`;
+        li.querySelector(".status").textContent = label + (r.error ? ` – ${r.error}` : "");
+        const actions = li.querySelector(".actions");
+        const res = document.createElement("button");
+        res.className = "small-btn primary";
+        res.textContent = "Resume";
+        res.disabled = !!mediaRecorder;
+        res.onclick = () => startRecording(r);
+        const fin = document.createElement("button");
+        fin.className = "small-btn";
+        fin.textContent = "Finish";
+        fin.disabled = !!mediaRecorder;
+        fin.onclick = async () => {
+          renewSignInDuringTap();
+          const saved = await finishVisit(r.id, r.parts, r.meta, r.seconds, r.createdAt);
+          await renderQueue();
+          renderSchedule();
+          if (saved.status === "pending") {
+            if (tokenValid()) uploadOne(saved.id);
+            else toast(`Saved ${r.meta.patient}. Tap ${useDirect() ? "Upload" : "Share to Drive"} to send it.`, 5000);
+          }
+        };
+        const del = document.createElement("button");
+        del.className = "small-btn";
+        del.textContent = "Delete";
+        del.onclick = async () => {
+          if (confirm("This visit is on hold and NOT uploaded. Delete it permanently?")) { await delRec(r.id); renderQueue(); renderSchedule(); }
+        };
+        actions.append(res, fin, del);
+        ul.appendChild(li);
+        continue;
+      }
       li.innerHTML = `
         <div>
           <div class="who"></div>
@@ -558,9 +712,10 @@
   $("btnRecord").onclick = startRecording;
   $("btnPause").onclick = togglePause;
   $("btnStop").onclick = stopRecording;
+  $("btnHold").onclick = holdRecording;
   $("btnUploadAll").onclick = async () => {
     const recs = await allRecs();
-    for (const r of recs) if (r.status !== "uploaded") await uploadOne(r.id);
+    for (const r of recs) if (r.status !== "uploaded" && r.status !== "held") await uploadOne(r.id);
   };
   $("btnClearDone").onclick = async () => {
     for (const r of await allRecs()) if (r.status === "uploaded") await delRec(r.id);
