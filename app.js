@@ -579,6 +579,14 @@
 
   // anything left "uploading" from a closed session goes back to pending
   allRecs().then(async (recs) => {
+    // Start each day clean: recordings from earlier days that are safely uploaded are
+    // removed. Anything NOT uploaded stays, so no visit is ever lost.
+    const today = todayISO();
+    for (const r of recs) {
+      const day = (r.meta && r.meta.date_of_service) || (r.createdAt || "").slice(0, 10);
+      if (r.status === "uploaded" && day < today) await delRec(r.id);
+    }
+    recs = await allRecs();
     for (const r of recs) if (r.status === "uploading") { r.status = "pending"; await putRec(r); }
     // Convert older recordings to plain bytes right away, while Safari can still read them.
     for (const r of recs) {
