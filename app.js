@@ -143,8 +143,18 @@
     }
   }
 
+  // Google access lasts about an hour, and Safari only lets PodNote renew it during a tap.
+  // So taps on Stop and on a patient renew it when it is close to running out; the
+  // recording then uploads by itself instead of waiting on the iPad as "Not uploaded".
+  function renewSignInDuringTap() {
+    if (useDirect() && tokenClient && !(token && Date.now() < tokenExpires - 10 * 60000)) {
+      getToken(10 * 60000).catch((e) => toast(e.message, 6000));
+    }
+  }
+
   function stopRecording() {
     if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+    renewSignInDuringTap();
     elapsedBefore = elapsed();
     mediaRecorder.stop();
   }
@@ -267,8 +277,9 @@
   }
   const tokenClientReady = prepareTokenClient().catch(() => {});
 
-  function getToken() {
-    if (token && Date.now() < tokenExpires - 60000) return Promise.resolve(token);
+  // minLeftMs: get a fresh token if the current one runs out sooner than this.
+  function getToken(minLeftMs = 60000) {
+    if (token && Date.now() < tokenExpires - minLeftMs) return Promise.resolve(token);
     if (!tokenClient) {
       return tokenClientReady.then(() => {
         throw new Error(tokenClient ? "Google sign-in is ready. Tap Connect again." : "Could not load Google sign-in (offline?)");
@@ -339,16 +350,41 @@
         $("schedNote").textContent = "No check-ins yet today. Chart Prep adds patients as they're roomed.";
       } else {
         const data = await (await gfetch(`https://www.googleapis.com/drive/v3/files/${list.files[0].id}?alt=media`)).json();
-        schedule = data.date === todayISO() ? data.patients || [] : [];
+        const all = data.date === todayISO() ? data.patients || [] : [];
+        // Hide patients whose note is already in ModMed (the push bot moves it to PodNote/Signed).
+        let pushed = new Set();
+        try { pushed = await loadPushed(); } catch (_) {}
+        schedule = all.filter((p) => !pushed.has(slug(p.name).toLowerCase()));
+        const hidden = all.length - schedule.length;
         const t = new Date(data.updated || list.files[0].modifiedTime);
-        $("schedNote").textContent = schedule.length
+        $("schedNote").textContent = (schedule.length
           ? `Updated ${t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Tap a patient, then Record.`
-          : "No check-ins yet today.";
+          : "No patients waiting.") + (hidden ? ` ${hidden} with notes already in ModMed are hidden.` : "");
       }
     } catch (e) {
       $("schedNote").textContent = "Couldn't load the checked-in list: " + e.message;
     }
     renderSchedule();
+  }
+
+  // Today's notes in My Drive/PodNote/Signed, as lowercase name slugs ("leon-luna").
+  let signedFolderId = null;
+  async function loadPushed() {
+    if (!signedFolderId) {
+      const fq = (n) => encodeURIComponent(`name='${n}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+      const podnote = (await (await gfetch(`https://www.googleapis.com/drive/v3/files?q=${fq("PodNote")}&fields=files(id)`)).json()).files || [];
+      const signed = (await (await gfetch(`https://www.googleapis.com/drive/v3/files?q=${fq("Signed")}&fields=files(id,parents)`)).json()).files || [];
+      const ids = new Set(podnote.map((f) => f.id));
+      const hit = signed.find((f) => (f.parents || []).some((p) => ids.has(p)));
+      if (!hit) return new Set();
+      signedFolderId = hit.id;
+    }
+    const q = encodeURIComponent(`'${signedFolderId}' in parents and trashed=false`);
+    const files = (await (await gfetch(
+      `https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime desc&pageSize=300&fields=files(name)`
+    )).json()).files || [];
+    const today = todayISO() + "__";
+    return new Set(files.filter((f) => f.name.startsWith(today)).map((f) => (f.name.split("__")[1] || "").toLowerCase()));
   }
 
   async function renderSchedule() {
@@ -363,6 +399,7 @@
       b.querySelector("small").textContent = [p.room, done.has(p.name) ? "recorded" : ""].filter(Boolean).join(" · ");
       b.onclick = () => {
         if (mediaRecorder) return;
+        renewSignInDuringTap();
         $("patient").value = p.name;
         $("visitType").value = p.new_patient ? "New patient" : "Follow-up";
         $("consent").checked = true;
@@ -377,7 +414,15 @@
     if (useDirect() && !tokenValid()) getToken().catch((e) => toast(e.message, 6000));
     else loadSchedule();
   };
-  schedTimer = setInterval(() => { if (!mediaRecorder && tokenValid()) loadSchedule(); }, 60000);
+  schedTimer = setInterval(() => {
+    if (!mediaRecorder && tokenValid()) loadSchedule();
+    // Show when Google access has run out, so it's obvious uploads need a tap.
+    if (useDirect() && token && !tokenValid()) {
+      $("driveStatus").textContent = "Drive: tap to reconnect";
+      $("driveStatus").classList.remove("on");
+      $("btnSched").textContent = "Connect Google";
+    }
+  }, 60000);
 
   // ---------- Share sheet fallback ----------
   async function shareUpload(rec) {
@@ -404,12 +449,12 @@
 
   async function uploadOne(id) {
     if (busy.has(id)) return;
+    busy.add(id);
     // Start Google sign-in before any await so Safari treats the popup as part of the tap.
     const signIn = useDirect() && !tokenValid() ? getToken() : null;
     if (signIn) signIn.catch(() => {});
     const rec = (await allRecs()).find((r) => r.id === id);
-    if (!rec || rec.status === "uploaded") return;
-    busy.add(id);
+    if (!rec || rec.status === "uploaded") { busy.delete(id); return; }
     rec.status = "uploading"; rec.error = "";
     await putRec(rec); renderQueue();
     try {
@@ -440,6 +485,8 @@
     const ul = $("queue");
     ul.innerHTML = "";
     $("emptyQueue").hidden = recs.length > 0;
+    const waiting = recs.filter((r) => r.status !== "uploaded").length;
+    $("btnUploadAll").textContent = waiting ? `Upload all (${waiting})` : "Upload all";
     for (const r of recs) {
       const li = document.createElement("li");
       const label = { pending: "Not uploaded", uploading: "Uploading…", uploaded: "Uploaded", error: "Failed" }[r.status] || r.status;
