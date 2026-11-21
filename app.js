@@ -330,6 +330,7 @@
     $("patient").value = "";
     $("quickNotes").value = "";
     $("consent").checked = true; // you only open PodNote for patients who signed the AI waiver
+    showPatient();
     await renderQueue();
     renderSchedule();
     if (!rec) return;
@@ -347,7 +348,16 @@
     }
   }
 
+  // The recorder sits above the Visit box, so show whose visit it is right there.
+  function showPatient() {
+    const n = $("patient").value.trim();
+    $("recPatient").textContent = n || "Tap a patient above";
+    $("recPatient").classList.toggle("muted", !n);
+  }
+  $("patient").addEventListener("input", showPatient);
+
   function setUI(state) {
+    showPatient();
     const rec = $("btnRecord"), pause = $("btnPause"), stop = $("btnStop");
     rec.disabled = state !== "idle";
     rec.classList.toggle("recording", state === "recording");
@@ -538,6 +548,7 @@
         $("patient").value = p.name;
         $("visitType").value = p.new_patient ? "New patient" : "Follow-up";
         $("consent").checked = true;
+        showPatient();
         renderSchedule();
         $("btnRecord").scrollIntoView({ behavior: "smooth", block: "center" });
       };

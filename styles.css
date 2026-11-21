@@ -45,6 +45,7 @@ textarea { resize: vertical; }
 .check { display: flex; gap: 10px; align-items: center; color: var(--text); font-size: 16px; }
 .check input { width: 22px; height: 22px; }
 .recorder { text-align: center; }
+.recpatient { font-size: 22px; font-weight: 700; }
 .timer { font-size: 64px; font-weight: 300; font-variant-numeric: tabular-nums; letter-spacing: 2px; }
 #meter { width: 100%; height: 60px; display: block; margin: 8px 0; }
 .controls { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 12px 0 4px; }

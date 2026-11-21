@@ -30,6 +30,22 @@
       <p id="schedNote" class="muted small"></p>
     </section>
 
+    <section class="card recorder">
+      <div id="recPatient" class="recpatient">Tap a patient above</div>
+      <div id="timer" class="timer">00:00</div>
+      <canvas id="meter" width="600" height="60" aria-hidden="true"></canvas>
+      <div id="recState" class="muted">Ready</div>
+      <div class="controls">
+        <button id="btnRecord" class="big rec">● Record</button>
+        <button id="btnPause" class="big" disabled>Pause</button>
+        <button id="btnStop" class="big stop" disabled>■ Stop &amp; Save</button>
+      </div>
+      <div class="controls">
+        <button id="btnHold" class="big hold" disabled>⏸ Hold – see another patient</button>
+      </div>
+      <p class="muted small">Hold saves this visit on the iPad so you can record another patient; tap Resume on it later. Keep PodNote on screen while recording.</p>
+    </section>
+
     <section class="card" id="visitCard">
       <h2>Visit</h2>
       <label>Patient name or MRN
@@ -47,22 +63,6 @@
         <textarea id="quickNotes" rows="2" placeholder="e.g. Right foot only. Debrided 3 nails. Vitals in chart."></textarea>
       </label>
       <label class="check"><input id="consent" type="checkbox" checked> Patient consented to ambient recording</label>
-    </section>
-
-    <section class="card recorder">
-      <div id="timer" class="timer">00:00</div>
-      <canvas id="meter" width="600" height="60" aria-hidden="true"></canvas>
-      <div id="recState" class="muted">Ready</div>
-      <div class="controls">
-        <button id="btnRecord" class="big rec">● Record</button>
-        <button id="btnPause" class="big" disabled>Pause</button>
-        <button id="btnStop" class="big stop" disabled>■ Stop &amp; Save</button>
-      </div>
-      <div class="controls">
-        <button id="btnHold" class="big hold" disabled>⏸ Hold – see another patient</button>
-      </div>
-      <p class="muted small">Hold keeps this visit on the iPad (not uploaded) so you can record another patient. When you go back, tap Resume on it below; Stop &amp; Save then joins both parts into one recording.</p>
-      <p class="muted small">Keep PodNote on screen while recording. iPadOS stops the microphone if you switch apps or lock the screen.</p>
     </section>
 
     <section class="card">
